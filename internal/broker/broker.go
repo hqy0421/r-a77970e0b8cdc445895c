@@ -552,12 +552,32 @@ func (b *Broker) handleOne(queue string, msg storage.Message) {
 		return
 	}
 
-	delay := h.opts.Backoff.Next(msg.Attempts)
+	delay := b.retryDelay(h, msg.Attempts, err)
 	msg.ScheduledAt = time.Now().Add(delay)
 	if err := b.store.Retry(b.storeCtx(), queue, msg, err); err != nil {
 		b.logger.ErrorContext(b.storeCtx(), "shoebox: retry transition failed",
 			slog.String("queue", queue), slog.String("id", msg.ID), slog.Any("err", err))
 	}
+}
+
+// retryDelay chooses how long to wait before the next attempt. A handler error
+// implementing retryAfterHint (for example a webhook target that answered with
+// Retry-After) supplies the wait; otherwise the handler's configured Backoff
+// decides. A positive HandlerOptions.MaxRetryAfter caps the hint — an
+// oversized wait is truncated to the cap, never rejected. The hint only
+// changes the timing; the attempt was already charged to the retry budget
+// before this is called.
+func (b *Broker) retryDelay(h *handler, attempt int, err error) time.Duration {
+	var hint retryAfterHint
+	if errors.As(err, &hint) {
+		if d := hint.RetryAfter(); d > 0 {
+			if limit := h.opts.MaxRetryAfter; limit > 0 && d > limit {
+				return limit
+			}
+			return d
+		}
+	}
+	return h.opts.Backoff.Next(attempt)
 }
 
 func (b *Broker) ack(queue, msgID string) error {

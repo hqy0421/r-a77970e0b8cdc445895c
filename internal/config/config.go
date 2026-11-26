@@ -60,6 +60,12 @@ type WebhookConfig struct {
 	Timeout     time.Duration `yaml:"timeout"`
 	ContentType string        `yaml:"content_type"`
 	Secret      string        `yaml:"secret"` // HMAC-SHA256 signing key (empty = unsigned)
+
+	// MaxRetryAfter caps how long a receiver's Retry-After header may defer
+	// the next attempt. Zero honors the receiver's wait as given. It changes
+	// timing only: retries still consume the retry budget and still
+	// dead-letter when exhausted.
+	MaxRetryAfter time.Duration `yaml:"max_retry_after"`
 }
 
 // defaults applies sensible defaults to an empty config.

@@ -26,5 +26,6 @@ webhooks:
     timeout: 10s                       # per-request HTTP timeout
     content_type: "application/json"   # Content-Type header on POST
     secret: "whsec-..."                # HMAC-SHA256 key; X-Shoebox-Signature header (empty = unsigned)
+    max_retry_after: 15m               # cap on a receiver's Retry-After wait (0 = as given)
   # emails:
   #   url: "https://hooks.example.com/emails"

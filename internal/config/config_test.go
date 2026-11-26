@@ -55,6 +55,7 @@ webhooks:
     url: "https://hooks.example.com/orders"
     timeout: 30s
     content_type: "text/plain"
+    max_retry_after: 20m
   emails:
     url: "https://hooks.example.com/emails"
 `
@@ -91,6 +92,9 @@ webhooks:
 	if wh.ContentType != "text/plain" {
 		t.Fatalf("orders content_type = %q", wh.ContentType)
 	}
+	if wh.MaxRetryAfter != 20*time.Minute {
+		t.Fatalf("orders max_retry_after = %v, want 20m", wh.MaxRetryAfter)
+	}
 
 	// emails has no timeout/content_type → should get defaults.
 	emails := c.Webhooks["emails"]
@@ -99,6 +103,9 @@ webhooks:
 	}
 	if emails.ContentType != "application/json" {
 		t.Fatalf("emails content_type default = %q", emails.ContentType)
+	}
+	if emails.MaxRetryAfter != 0 {
+		t.Fatalf("emails max_retry_after default = %v, want 0 (uncapped)", emails.MaxRetryAfter)
 	}
 }
 

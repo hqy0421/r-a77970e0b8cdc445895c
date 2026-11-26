@@ -122,9 +122,10 @@ func (q *Queue) Handle(queue string, h HandlerFunc, opts ...HandlerOptions) {
 		ho.Backoff = retry.Exponential(1*time.Second, 60*time.Second)
 	}
 	q.b.Register(queue, h, broker.HandlerOptions{
-		MaxRetries: ho.MaxRetries,
-		Backoff:    ho.Backoff,
-		Timeout:    ho.Timeout,
+		MaxRetries:    ho.MaxRetries,
+		Backoff:       ho.Backoff,
+		Timeout:       ho.Timeout,
+		MaxRetryAfter: ho.MaxRetryAfter,
 	})
 }
 

@@ -15,6 +15,12 @@ and releases follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Webhook retries honor a receiver's HTTP `Retry-After` header (delta-seconds
+  or HTTP-date) for the next attempt, with `HandlerOptions.MaxRetryAfter`
+  capping the wait. A missing or invalid hint falls back to the configured
+  backoff, retries still consume `MaxRetries`, and messages still dead-letter
+  when the budget is spent. Handlers can request a wait directly by returning
+  a `RetryAfterError` via `WithRetryAfter`.
 - Release automation for server binaries and the container image.
 
 ## [0.1.6] - 2026-08-18

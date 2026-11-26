@@ -95,6 +95,16 @@ type HandlerOptions struct {
 	// a non-zero Timeout is what lets Shutdown and Drain complete even
 	// when a handler is blocked.
 	Timeout time.Duration
+
+	// MaxRetryAfter caps how long a handler may defer its next attempt by
+	// returning a RetryAfterError (or, for WebhookHandler, by receiving a
+	// Retry-After response header). A longer requested wait is truncated to
+	// this value; a missing or invalid hint falls back to Backoff. Zero
+	// disables the cap, so the requested wait is honored as given.
+	//
+	// This affects timing only: every retry still consumes the MaxRetries
+	// budget and the message still dead-letters when that budget is spent.
+	MaxRetryAfter time.Duration
 }
 
 // EnqueueOptions is a functional-options bundle for Enqueue.

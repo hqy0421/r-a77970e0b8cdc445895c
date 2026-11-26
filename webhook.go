@@ -21,6 +21,10 @@ import (
 // (backoff) and eventually a dead-letter. Register it per queue with:
 //
 //	q.Handle("orders", shoebox.WebhookHandler("https://hooks.example.com/orders"))
+//
+// A non-2xx response carrying a valid Retry-After header defers the next
+// attempt to that time instead of the configured backoff. See
+// parseRetryAfter and shoebox.HandlerOptions.MaxRetryAfter.
 
 // WebhookOption configures a WebhookHandler.
 type WebhookOption func(*webhookConfig)
@@ -79,8 +83,11 @@ type webhookHandler struct {
 
 // WebhookHandler returns a HandlerFunc that POSTs the message payload to
 // target. A non-2xx response returns an error, triggering the broker's
-// normal retry/backoff/DLQ path. The message travels in its payload; message
-// context is attached as headers so the receiver can correlate:
+// normal retry/backoff/DLQ path. When that response carries a valid
+// Retry-After header, the next attempt is deferred to the requested time
+// instead of the backoff, subject to HandlerOptions.MaxRetryAfter. The
+// message travels in its payload; message context is attached as headers so
+// the receiver can correlate:
 //
 //	X-Shoebox-Message-ID   the message ID (matches the API's DELETE path)
 //	X-Shoebox-Queue        the source queue name
@@ -172,8 +179,47 @@ func (h *webhookHandler) deliver(ctx context.Context, m Message) error {
 		// Read a bounded snippet of the response body so the DLQ page
 		// shows something actionable, then treat it as a delivery failure.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("webhook: %s returned %d: %s",
+		err := fmt.Errorf("webhook: %s returned %d: %s",
 			h.target, resp.StatusCode, strings.TrimSpace(string(body)))
+		// A receiver may ask us to slow down with Retry-After. Pass the wait
+		// to the broker so the next attempt is scheduled then instead of on
+		// the handler's backoff. An unparseable header is ignored: the broker
+		// then falls back to normal backoff, and the attempt still counts
+		// against the retry budget either way.
+		if d, ok := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ok {
+			return WithRetryAfter(err, d)
+		}
+		return err
 	}
 	return nil
+}
+
+// parseRetryAfter interprets an HTTP Retry-After header value. RFC 9110 allows
+// either delta-seconds ("120") or an HTTP-date ("Wed, 21 Oct 2015 07:28:00
+// GMT"). It returns the resulting wait and whether the value was usable.
+// Negative or zero delta-seconds are valid ("retry now") but yield a
+// non-positive delay, which is reported as not usable so the caller keeps its
+// normal backoff. Past dates are treated the same way.
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if secs, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0, false
+		}
+		// Clamp absurd values so the multiply cannot overflow.
+		const maxSecs = int64(1<<63-1) / int64(time.Second)
+		if secs > maxSecs {
+			secs = maxSecs
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(value); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d, true
+		}
+	}
+	return 0, false
 }

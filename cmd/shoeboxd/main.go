@@ -116,11 +116,13 @@ func main() {
 		if wh.Secret != "" {
 			whOpts = append(whOpts, shoebox.WithWebhookSecret(wh.Secret))
 		}
-		q.Handle(queue, shoebox.WebhookHandler(wh.URL, nil, whOpts...))
+		hOpts := shoebox.HandlerOptions{MaxRetryAfter: wh.MaxRetryAfter}
+		q.Handle(queue, shoebox.WebhookHandler(wh.URL, nil, whOpts...), hOpts)
 		logger.Info("webhook registered",
 			slog.String("queue", queue),
 			slog.String("url", wh.URL),
 			slog.Bool("signed", wh.Secret != ""),
+			slog.Duration("max_retry_after", wh.MaxRetryAfter),
 		)
 	}
 

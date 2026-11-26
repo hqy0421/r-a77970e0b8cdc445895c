@@ -262,6 +262,21 @@ q.Handle("webhooks", handler, shoebox.HandlerOptions{
 })
 ```
 
+A handler can also ask for a specific wait before the next attempt by
+returning a `RetryAfterError`. The queue schedules that retry at the requested
+time instead of using the backoff; a valid `Retry-After` header on a webhook
+response produces one automatically. `MaxRetryAfter` caps an oversized wait,
+and a missing or invalid hint falls back to the normal backoff. The hint only
+changes timing: the attempt still counts against `MaxRetries` and still
+dead-letters once that budget is spent.
+
+```go
+q.Handle("webhooks", shoebox.WebhookHandler(url, nil), shoebox.HandlerOptions{
+    MaxRetries:    10,
+    MaxRetryAfter: 15 * time.Minute, // honor Retry-After up to 15m
+})
+```
+
 Each queue has a corresponding `{queue}.dlq` queue. Dead-letter records retain
 the original payload, last error, retry count, and timestamp.
 
@@ -497,8 +512,10 @@ Configure `dashboard_user` and `dashboard_password` for dashboard Basic Auth;
 `auth_token` protects API requests.
 
 Webhook delivery can be configured per queue. A non-2xx response follows the
-same retry, backoff, and DLQ path as any other handler. It is also available in
-library mode:
+same retry, backoff, and DLQ path as any other handler. When the response
+carries a `Retry-After` header, the next attempt is scheduled at that time
+(delta-seconds or an HTTP-date) instead of the configured backoff, capped by
+`HandlerOptions.MaxRetryAfter`. It is also available in library mode:
 
 ```go
 q.Handle("orders", shoebox.WebhookHandler("https://hooks.example.com/orders"))

@@ -29,6 +29,20 @@ type HandlerOptions struct {
 	MaxRetries int
 	Backoff    retry.Backoff
 	Timeout    time.Duration
+
+	// MaxRetryAfter caps how long a retryAfterHint may defer the next
+	// attempt. Zero means no cap. It does not affect Backoff decisions.
+	MaxRetryAfter time.Duration
+}
+
+// retryAfterHint is implemented by handler errors that request a specific
+// wait before the next attempt — for example when a webhook target answers
+// with an HTTP Retry-After header. The broker uses the delay in place of the
+// handler's Backoff for that retry, capped by HandlerOptions.MaxRetryAfter.
+// The attempt still consumes the retry budget: it is counted in Attempts and
+// takes the normal dead-letter path once MaxRetries is exhausted.
+type retryAfterHint interface {
+	RetryAfter() time.Duration
 }
 
 // logSink is the subset of *slog.Logger the broker uses. It exists so
