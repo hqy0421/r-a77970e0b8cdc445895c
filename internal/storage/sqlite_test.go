@@ -1,0 +1,725 @@
+package storage
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// newTestSQLite opens an in-memory SQLite database for testing. Using
+// ":memory:" gives us a fresh, isolated database per test with no file
+// cleanup needed.
+func newTestSQLite(t *testing.T) *SQLite {
+	t.Helper()
+	s, err := NewSQLite(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// mustEnqueueStore is the storage.Storage variant of mustEnqueue (which only
+// accepts *Memory). This works for any backend.
+func mustEnqueueStore(t *testing.T, s Storage, queue string, msg Message) {
+	t.Helper()
+	if err := s.Enqueue(context.Background(), queue, msg); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+}
+
+// TestSQLite_EnqueueDequeue verifies basic FIFO enqueue and dequeue.
+func TestSQLite_EnqueueDequeue(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+
+	for _, p := range []string{"a", "b", "c"} {
+		if err := s.Enqueue(ctx, "q", Message{ID: p, Payload: []byte(p)}); err != nil {
+			t.Fatalf("Enqueue %s: %v", p, err)
+		}
+	}
+
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d messages, want 3", len(got))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if got[i].ID != want {
+			t.Errorf("msg[%d].ID = %q, want %q", i, got[i].ID, want)
+		}
+	}
+}
+
+func TestSQLite_EnqueueBatch(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+
+	if err := s.EnqueueBatch(ctx, "q", []Message{
+		{ID: "a", Payload: []byte("a")},
+		{ID: "b", Payload: []byte("b")},
+		{ID: "c", Payload: []byte("c")},
+	}); err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 3 || got[0].ID != "a" || got[1].ID != "b" || got[2].ID != "c" {
+		t.Fatalf("got %v, want [a b c]", ids(got))
+	}
+	if !got[0].CreatedAt.Before(got[1].CreatedAt) || !got[1].CreatedAt.Before(got[2].CreatedAt) {
+		t.Fatalf("CreatedAt order = %v, want strict batch order", []time.Time{got[0].CreatedAt, got[1].CreatedAt, got[2].CreatedAt})
+	}
+}
+
+func TestSQLite_EnqueueBatchEmpty(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	if err := s.EnqueueBatch(ctx, "q", nil); err != nil {
+		t.Fatalf("EnqueueBatch empty: %v", err)
+	}
+	if got, err := s.Dequeue(ctx, "q", 1); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("Dequeue after empty batch = %v, %v; want ErrEmpty", ids(got), err)
+	}
+}
+
+func TestSQLite_EnqueueBatchRollsBackOnError(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	mustEnqueueStore(t, s, "q", Message{ID: "dupe"})
+
+	err := s.EnqueueBatch(ctx, "q", []Message{{ID: "a"}, {ID: "dupe"}, {ID: "c"}})
+	if err == nil {
+		t.Fatal("EnqueueBatch succeeded with duplicate ID")
+	}
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "dupe" {
+		t.Fatalf("after failed batch, got %v, want only [dupe]", ids(got))
+	}
+}
+
+// TestSQLite_DequeueFIFOOrder verifies messages come out in the same order
+// they went in, across multiple dequeue batches.
+func TestSQLite_DequeueFIFOOrder(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	for i, p := range []string{"a", "b", "c", "d", "e"} {
+		mustEnqueueStore(t, s, "q", Message{ID: p, Payload: []byte{byte(i)}})
+	}
+
+	got, _ := s.Dequeue(ctx, "q", 3)
+	if len(got) != 3 {
+		t.Fatalf("first dequeue: got %d, want 3", len(got))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if got[i].ID != want {
+			t.Errorf("first[%d] = %q, want %q", i, got[i].ID, want)
+		}
+	}
+
+	got2, _ := s.Dequeue(ctx, "q", 10)
+	if len(got2) != 2 {
+		t.Fatalf("second dequeue: got %d, want 2", len(got2))
+	}
+	for i, want := range []string{"d", "e"} {
+		if got2[i].ID != want {
+			t.Errorf("second[%d] = %q, want %q", i, got2[i].ID, want)
+		}
+	}
+}
+
+// TestSQLite_DequeueVisibleAtFiltering verifies scheduled messages are not
+// returned until their scheduled time.
+func TestSQLite_DequeueVisibleAtFiltering(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+
+	mustEnqueueStore(t, s, "q", Message{ID: "due", ScheduledAt: time.Now().Add(-time.Second)})
+	mustEnqueueStore(t, s, "q", Message{ID: "due2", ScheduledAt: time.Now().Add(-time.Second)})
+	laterAt := time.Now().Add(500 * time.Millisecond)
+	mustEnqueueStore(t, s, "q", Message{ID: "later", ScheduledAt: laterAt})
+
+	got, err := s.Dequeue(ctx, "q", 5)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "due" || got[1].ID != "due2" {
+		t.Fatalf("got %v, want [due due2]", ids(got))
+	}
+
+	// "later" is not due yet.
+	if _, err := s.Dequeue(ctx, "q", 5); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("before due: err = %v, want ErrEmpty", err)
+	}
+
+	time.Sleep(time.Until(laterAt) + 20*time.Millisecond)
+	got, err = s.Dequeue(ctx, "q", 5)
+	if err != nil {
+		t.Fatalf("Dequeue after delay: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "later" {
+		t.Fatalf("got %v, want [later]", ids(got))
+	}
+}
+
+// TestSQLite_EmptyQueueReturnsErrEmpty verifies the sentinel error.
+func TestSQLite_EmptyQueueReturnsErrEmpty(t *testing.T) {
+	s := newTestSQLite(t)
+	if _, err := s.Dequeue(context.Background(), "q", 5); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("err = %v, want ErrEmpty", err)
+	}
+}
+
+// TestSQLite_AckRemovesMessage verifies Ack deletes the message so it's not
+// redelivered.
+func TestSQLite_AckRemovesMessage(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	mustEnqueueStore(t, s, "q", Message{ID: "x"})
+	mustEnqueueStore(t, s, "q", Message{ID: "y"})
+
+	if _, err := s.Dequeue(ctx, "q", 1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.Ack(ctx, "q", "x"); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+
+	// Only "y" should remain.
+	got, _ := s.Dequeue(ctx, "q", 10)
+	if len(got) != 1 || got[0].ID != "y" {
+		t.Fatalf("after ack, got %v, want [y]", ids(got))
+	}
+}
+
+func TestSQLite_AckIgnoresPendingMessage(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	mustEnqueueStore(t, s, "q", Message{ID: "x"})
+
+	if err := s.Ack(ctx, "q", "x"); err != nil {
+		t.Fatalf("Ack pending: %v", err)
+	}
+	stats, err := s.Stats(ctx, "q")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Processed != 0 {
+		t.Fatalf("Processed = %d, want 0", stats.Processed)
+	}
+	got, err := s.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "x" {
+		t.Fatalf("after pending ack, got %v, want [x]", ids(got))
+	}
+}
+
+func TestSQLite_AckBatchCountsOnlyProcessing(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	for _, id := range []string{"a", "b", "c", "pending"} {
+		mustEnqueueStore(t, s, "q", Message{ID: id})
+	}
+	if _, err := s.Dequeue(ctx, "q", 3); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.AckBatch(ctx, "q", []string{"a", "c", "pending", "missing"}); err != nil {
+		t.Fatalf("AckBatch: %v", err)
+	}
+	if err := s.AckBatch(ctx, "q", nil); err != nil {
+		t.Fatalf("AckBatch empty: %v", err)
+	}
+	stats, err := s.Stats(ctx, "q")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Processed != 2 {
+		t.Fatalf("Processed = %d, want 2", stats.Processed)
+	}
+	if err := s.Reclaim(ctx, "q"); err != nil {
+		t.Fatalf("Reclaim: %v", err)
+	}
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue remaining: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "b" || got[1].ID != "pending" {
+		t.Fatalf("remaining = %v, want [b pending]", ids(got))
+	}
+}
+
+// TestSQLite_Stats verifies counters move correctly through atomic lifecycle
+// transitions.
+func TestSQLite_Stats(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	mustEnqueueStore(t, s, "q", Message{ID: "ok"})
+	mustEnqueueStore(t, s, "q", Message{ID: "retry"})
+	mustEnqueueStore(t, s, "q", Message{ID: "dead"})
+
+	msgs, err := s.Dequeue(ctx, "q", 3)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.Ack(ctx, "q", "ok"); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if err := s.Retry(ctx, "q", msgs[1], errors.New("boom")); err != nil {
+		t.Fatalf("Retry: %v", err)
+	}
+	if err := s.DeadLetter(ctx, "q", msgs[2], errors.New("dead")); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+
+	stats, err := s.Stats(ctx, "q")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Processed != 1 {
+		t.Errorf("Processed = %d, want 1", stats.Processed)
+	}
+	if stats.Errors != 1 {
+		t.Errorf("Errors = %d, want 1", stats.Errors)
+	}
+	if stats.Retries != 1 {
+		t.Errorf("Retries = %d, want 1", stats.Retries)
+	}
+	if stats.Dead != 1 {
+		t.Errorf("Dead = %d, want 1", stats.Dead)
+	}
+}
+
+// TestSQLite_StatsDepthExcludesInFlight verifies that once a message is
+// dequeued (status='processing') it is no longer counted in Depth.
+func TestSQLite_StatsDepthExcludesInFlight(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	for _, p := range []string{"a", "b", "c"} {
+		mustEnqueueStore(t, s, "q", Message{ID: p})
+	}
+
+	if stats, _ := s.Stats(ctx, "q"); stats.Depth != 3 {
+		t.Fatalf("after enqueue, depth = %d, want 3", stats.Depth)
+	}
+	if _, err := s.Dequeue(ctx, "q", 2); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if stats, _ := s.Stats(ctx, "q"); stats.Depth != 1 {
+		t.Fatalf("after dequeue 2, depth = %d, want 1", stats.Depth)
+	}
+}
+
+// TestSQLite_CrashRecovery is the E2-S1 regression test. It simulates a crash
+// by closing the database mid-flight (leaving messages in 'processing'), then
+// reopens and verifies those messages are reclaimed to 'pending' and
+// redelivered.
+func TestSQLite_CrashRecovery(t *testing.T) {
+	ctx := context.Background()
+
+	// Use a temp file so the data survives the close.
+	path := filepath.Join(t.TempDir(), "test.db")
+	s1, err := NewSQLite(ctx, path)
+	if err != nil {
+		t.Fatalf("NewSQLite s1: %v", err)
+	}
+
+	mustEnqueueStore(t, s1, "q", Message{ID: "survivor", Payload: []byte("data")})
+
+	// Dequeue but DON'T ack — simulates a crash mid-handler.
+	msgs, err := s1.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue s1: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].ID != "survivor" {
+		t.Fatalf("got %v, want [survivor]", ids(msgs))
+	}
+
+	// "Crash": close without acking.
+	_ = s1.Close()
+
+	// Reopen — Reclaim should transition 'processing' → 'pending'.
+	s2, err := NewSQLite(ctx, path)
+	if err != nil {
+		t.Fatalf("NewSQLite s2: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	// The message must be redelivered.
+	msgs2, err := s2.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue s2: %v", err)
+	}
+	if len(msgs2) != 1 || msgs2[0].ID != "survivor" {
+		t.Fatalf("after recovery, got %v, want [survivor]", ids(msgs2))
+	}
+	if string(msgs2[0].Payload) != "data" {
+		t.Errorf("payload = %q, want %q", string(msgs2[0].Payload), "data")
+	}
+}
+
+// TestSQLite_DeadLetterFlow verifies that DeadLetter atomically inserts the
+// DLQ record, marks the source row dead, and records the outcome.
+func TestSQLite_DeadLetterFlow(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	mustEnqueueStore(t, s, "orders", Message{ID: "poison", Payload: []byte("bad")})
+
+	msgs, err := s.Dequeue(ctx, "orders", 1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+
+	if err := s.DeadLetter(ctx, "orders", msgs[0], errors.New("handler failed")); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+
+	dead, err := s.List(ctx, "orders", 10)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(dead) != 1 {
+		t.Fatalf("got %d dead messages, want 1", len(dead))
+	}
+	if dead[0].ID != "poison" {
+		t.Errorf("dead[0].ID = %q, want %q", dead[0].ID, "poison")
+	}
+	if dead[0].Error != "handler failed" {
+		t.Errorf("dead[0].Error = %q, want %q", dead[0].Error, "handler failed")
+	}
+	dlq, err := s.List(ctx, "orders.dlq", 10)
+	if err != nil {
+		t.Fatalf("List DLQ: %v", err)
+	}
+	if len(dlq) != 1 || string(dlq[0].Payload) != "bad" {
+		t.Fatalf("DLQ = %+v, want one payload", dlq)
+	}
+}
+
+func TestSQLite_ReplayMovesDLQMessageAtomically(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	mustEnqueueStore(t, s, "orders", Message{ID: "poison", Payload: []byte("bad")})
+	msgs, err := s.Dequeue(ctx, "orders", 1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.DeadLetter(ctx, "orders", msgs[0], errors.New("handler failed")); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+
+	dead, err := s.List(ctx, "orders.dlq", 1)
+	if err != nil {
+		t.Fatalf("List DLQ: %v", err)
+	}
+	if err := s.Replay(ctx, "orders", dead[0].ID); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if _, err := s.List(ctx, "orders.dlq", 1); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("DLQ after replay error = %v, want ErrEmpty", err)
+	}
+	replayed, err := s.Dequeue(ctx, "orders", 1)
+	if err != nil {
+		t.Fatalf("Dequeue replayed message: %v", err)
+	}
+	if len(replayed) != 1 || string(replayed[0].Payload) != "bad" {
+		t.Fatalf("replayed = %+v, want one payload", replayed)
+	}
+	if replayed[0].Error != "" || !replayed[0].DeadAt.IsZero() {
+		t.Fatalf("replayed metadata = %+v, want live message metadata", replayed[0])
+	}
+	stats, err := s.Stats(ctx, "orders.dlq")
+	if err != nil {
+		t.Fatalf("DLQ stats: %v", err)
+	}
+	if stats.Processed != 1 {
+		t.Fatalf("DLQ processed = %d, want 1", stats.Processed)
+	}
+}
+
+func TestSQLite_ReplayRollsBackWhenSourceInsertFails(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	mustEnqueueStore(t, s, "orders", Message{ID: "poison", Payload: []byte("bad")})
+	msgs, err := s.Dequeue(ctx, "orders", 1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.DeadLetter(ctx, "orders", msgs[0], errors.New("handler failed")); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+	dead, err := s.List(ctx, "orders.dlq", 1)
+	if err != nil {
+		t.Fatalf("List DLQ: %v", err)
+	}
+
+	// A trigger makes the source insert fail after the DLQ delete. The
+	// transaction must restore the DLQ row.
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TRIGGER fail_replay_insert
+		BEFORE INSERT ON shoebox_messages
+		WHEN NEW.queue = 'orders'
+		BEGIN SELECT RAISE(ABORT, 'replay insert blocked'); END;`); err != nil {
+		t.Fatalf("create replay failure trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(context.Background(), `DROP TRIGGER fail_replay_insert`)
+	})
+	if err := s.Replay(ctx, "orders", dead[0].ID); err == nil {
+		t.Fatal("Replay succeeded despite source insert failure")
+	}
+	remaining, err := s.List(ctx, "orders.dlq", 1)
+	if err != nil {
+		t.Fatalf("List DLQ after failed replay: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].ID != dead[0].ID {
+		t.Fatalf("DLQ after failed replay = %+v, want original row", remaining)
+	}
+}
+
+// TestSQLite_ListEmptyReturnsErrEmpty verifies List on a queue with no dead
+// messages returns the sentinel.
+func TestSQLite_ListEmptyReturnsErrEmpty(t *testing.T) {
+	s := newTestSQLite(t)
+	if _, err := s.List(context.Background(), "q", 10); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("err = %v, want ErrEmpty", err)
+	}
+}
+
+// TestSQLite_MetadataRoundTrip verifies metadata survives the JSON
+// serialise/deserialise cycle.
+func TestSQLite_MetadataRoundTrip(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	meta := map[string]string{"trace_id": "abc-123", "url": "https://example.com/hook"}
+	mustEnqueueStore(t, s, "q", Message{ID: "m", Metadata: meta})
+
+	got, err := s.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d messages, want 1", len(got))
+	}
+	for k, want := range meta {
+		if got[0].Metadata[k] != want {
+			t.Errorf("metadata[%q] = %q, want %q", k, got[0].Metadata[k], want)
+		}
+	}
+}
+
+// TestSQLite_Reclaim transitions processing messages back to pending.
+func TestSQLite_Reclaim(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+	mustEnqueueStore(t, s, "q", Message{ID: "x"})
+
+	// Dequeue to set status='processing'.
+	if _, err := s.Dequeue(ctx, "q", 1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+
+	// Reclaim.
+	if err := s.Reclaim(ctx, "q"); err != nil {
+		t.Fatalf("Reclaim: %v", err)
+	}
+
+	// Message should be dequeueable again.
+	got, err := s.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue after reclaim: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "x" {
+		t.Fatalf("got %v, want [x]", ids(got))
+	}
+}
+
+// TestSQLite_MigrationUpgradeFromV1 mirrors the Postgres upgrade test: a
+// database carrying only the 0001 schema (no priority column, user_version
+// 0) must be detected as a legacy database, upgraded to the latest
+// migration, and remain fully functional.
+func TestSQLite_MigrationUpgradeFromV1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upgrade.db")
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, upMigration(t, "sqlite", 1).SQL); err != nil {
+		_ = db.Close()
+		t.Fatalf("apply 0001: %v", err)
+	}
+	_ = db.Close()
+
+	s, err := NewSQLite(ctx, path)
+	if err != nil {
+		t.Fatalf("NewSQLite on v1 database: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	// Priority ordering (0002's column) must work end to end.
+	mustEnqueueStore(t, s, "q", Message{ID: "low", Payload: []byte("low")})
+	mustEnqueueStore(t, s, "q", Message{ID: "high", Payload: []byte("high"), Priority: 2})
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "high" || got[1].ID != "low" {
+		t.Fatalf("dequeue after upgrade = %v, want [high low]", ids(got))
+	}
+
+	version, err := sqliteUserVersion(ctx, s.db)
+	if err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if version != 4 {
+		t.Fatalf("user_version after upgrade = %d, want 4", version)
+	}
+}
+
+func TestSQLiteWALAndBusyTimeout(t *testing.T) {
+	s, err := NewSQLite(context.Background(), filepath.Join(t.TempDir(), "wal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	var journal string
+	if err := s.db.QueryRow(`PRAGMA journal_mode`).Scan(&journal); err != nil {
+		t.Fatal(err)
+	}
+	if journal != "wal" {
+		t.Fatalf("journal mode = %q, want wal", journal)
+	}
+	var timeout int
+	if err := s.db.QueryRow(`PRAGMA busy_timeout`).Scan(&timeout); err != nil {
+		t.Fatal(err)
+	}
+	if timeout != 5000 {
+		t.Fatalf("busy timeout = %d, want 5000", timeout)
+	}
+}
+
+func TestSQLiteConcurrentFileHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "concurrent.db")
+	s1, err := NewSQLite(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s1.Close() }()
+	s2, err := NewSQLite(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+	ctx := context.Background()
+	done := make(chan error, 2)
+	for _, s := range []*SQLite{s1, s2} {
+		go func(s *SQLite) {
+			for i := 0; i < 50; i++ {
+				if err := s.Enqueue(ctx, "concurrent", Message{ID: NewMessageID(), Payload: []byte("x")}); err != nil {
+					done <- err
+					return
+				}
+			}
+			done <- nil
+		}(s)
+	}
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := 0
+	for got < 100 {
+		msgs, err := s1.Dequeue(ctx, "concurrent", 100)
+		if err == ErrEmpty {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got += len(msgs)
+	}
+}
+func TestSQLite_RunScheduleAtomic(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	s := newTestSQLite(t)
+	schedule := Schedule{
+		ID: "periodic", Queue: "q", Payload: []byte("payload"),
+		Interval: time.Minute, NextRunAt: now.Add(-time.Minute),
+		Enabled: true, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateSchedule(ctx, schedule); err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+
+	ran, err := s.RunSchedule(ctx, schedule, now, now.Add(time.Minute))
+	if err != nil || !ran {
+		t.Fatalf("RunSchedule = (%t, %v), want (true, nil)", ran, err)
+	}
+	due, err := s.DueSchedules(ctx, now, 10)
+	if err != nil {
+		t.Fatalf("DueSchedules: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("DueSchedules = %v, want no due schedules", due)
+	}
+	stored, err := s.ListSchedules(ctx, "q")
+	if err != nil {
+		t.Fatalf("ListSchedules: %v", err)
+	}
+	if len(stored) != 1 || !stored[0].NextRunAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("stored schedule = %v, want next run at %v", stored, now.Add(time.Minute))
+	}
+
+	msgs, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(msgs) != 1 || string(msgs[0].Payload) != "payload" ||
+		!msgs[0].CreatedAt.Equal(now) || !msgs[0].ScheduledAt.Equal(now) {
+		t.Fatalf("occurrence = %+v, want one immediate payload", msgs)
+	}
+
+	blocked := schedule
+	blocked.ID = "blocked"
+	blocked.Queue = "blocked"
+	if err := s.CreateSchedule(ctx, blocked); err != nil {
+		t.Fatalf("CreateSchedule blocked: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE TRIGGER fail_periodic_insert
+		BEFORE INSERT ON shoebox_messages WHEN NEW.queue = 'blocked'
+		BEGIN SELECT RAISE(ABORT, 'periodic insert blocked'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(context.Background(), `DROP TRIGGER IF EXISTS fail_periodic_insert`)
+	})
+
+	ran, err = s.RunSchedule(ctx, blocked, now, now.Add(time.Minute))
+	if err == nil || ran {
+		t.Fatalf("blocked RunSchedule = (%t, %v), want (false, error)", ran, err)
+	}
+	due, err = s.DueSchedules(ctx, now, 10)
+	if err != nil {
+		t.Fatalf("DueSchedules after failed run: %v", err)
+	}
+	if len(due) != 1 || due[0].ID != blocked.ID ||
+		!due[0].NextRunAt.Equal(blocked.NextRunAt) {
+		t.Fatalf("due after failed run = %v, want blocked schedule at original cadence", due)
+	}
+}

@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: shoebox
+        ports:
+          - 5432:5432
+        # Health check doubles as the readiness gate: steps do not start
+        # until the server accepts connections.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d shoebox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      SHOEBOX_TEST_POSTGRES_DSN: host=localhost port=5432 dbname=shoebox user=postgres password=postgres sslmode=disable
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.1
+          args: ./...
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go list ./... | grep -v '/examples/' | xargs go test
+
+      - name: Test with coverage
+        run: go list ./... | grep -v '/examples/' | xargs go test -covermode=atomic -coverprofile=coverage.out
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        with:
+          files: ./coverage.out
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Test with race detector
+        run: go list ./... | grep -v '/examples/' | xargs go test -race
+
+      - name: Vet
+        run: go list ./... | grep -v '/examples/' | xargs go vet
+
+      - name: Test OpenTelemetry module
+        run: cd otel && go test ./...
+
+      - name: Vet OpenTelemetry module
+        run: cd otel && go vet ./...

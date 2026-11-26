@@ -1,0 +1,901 @@
+package storage
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"github.com/adexaja/shoebox/migrations"
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// testDSN is the Postgres connection string used by storage tests and
+// benchmarks. It is taken from SHOEBOX_TEST_POSTGRES_DSN when set — CI
+// injects the service-container credentials this way. Without it, tests
+// fall back to a local development server using trust/peer auth. Tests
+// skip when the server is unreachable.
+var testDSN = func() string {
+	if dsn := os.Getenv("SHOEBOX_TEST_POSTGRES_DSN"); dsn != "" {
+		return dsn
+	}
+	return "host=localhost port=5432 dbname=shoebox user=postgres sslmode=disable"
+}()
+
+func TestQuotePostgresIdentifier(t *testing.T) {
+	got, err := quotePostgresIdentifier(`worker"queue`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `"worker""queue"` {
+		t.Fatalf("quoted identifier = %q, want %q", got, `"worker""queue"`)
+	}
+	if _, err := quotePostgresIdentifier(""); err == nil {
+		t.Fatal("expected empty identifier to fail")
+	}
+	if _, err := quotePostgresIdentifier("bad\x00schema"); err == nil {
+		t.Fatal("expected NUL-containing identifier to fail")
+	}
+}
+
+// skipIfNoPostgres skips the test if the local Postgres is not reachable.
+func skipIfNoPostgres(t *testing.T) {
+	t.Helper()
+	s, err := NewPostgres(context.Background(), testDSN)
+	if err != nil {
+		t.Skipf("Postgres not available: %v", err)
+	}
+	_ = s.Close()
+}
+
+// newTestPostgres opens a fresh Postgres backend and cleans the tables so
+// each test starts from a known-empty state.
+func newTestPostgres(t *testing.T) *Postgres {
+	t.Helper()
+	skipIfNoPostgres(t)
+	s, err := NewPostgres(context.Background(), testDSN)
+	if err != nil {
+		t.Fatalf("NewPostgres: %v", err)
+	}
+	// Reset to a fresh database so each test starts from a known-empty
+	// state. The migration table must go too, otherwise the re-open below
+	// would trust its recorded version and skip rebuilding the schema.
+	ctx := context.Background()
+	for _, table := range []string{
+		"shoebox_messages", "shoebox_stats", "shoebox_schedules", "shoebox_schema_migrations",
+	} {
+		if _, err := s.pool.Exec(ctx, "DROP TABLE IF EXISTS "+table); err != nil {
+			_ = s.Close()
+			t.Fatalf("drop %s: %v", table, err)
+		}
+	}
+	_ = s.Close()
+
+	s, err = NewPostgres(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("NewPostgres (re-open): %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func mustPgEnqueue(t *testing.T, s *Postgres, queue string, msg Message) {
+	t.Helper()
+	if err := s.Enqueue(context.Background(), queue, msg); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+}
+
+func TestPostgres_EnqueueDequeue(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+
+	for _, p := range []string{"a", "b", "c"} {
+		mustPgEnqueue(t, s, "q", Message{ID: p, Payload: []byte(p)})
+	}
+
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d messages, want 3", len(got))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if got[i].ID != want {
+			t.Errorf("msg[%d].ID = %q, want %q", i, got[i].ID, want)
+		}
+	}
+}
+
+func TestPostgres_EnqueueBatch(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+
+	if err := s.EnqueueBatch(ctx, "q", []Message{
+		{ID: "a", Payload: []byte("a")},
+		{ID: "b", Payload: []byte("b")},
+		{ID: "c", Payload: []byte("c")},
+	}); err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 3 || got[0].ID != "a" || got[1].ID != "b" || got[2].ID != "c" {
+		t.Fatalf("got %v, want [a b c]", ids(got))
+	}
+	if !got[0].CreatedAt.Before(got[1].CreatedAt) || !got[1].CreatedAt.Before(got[2].CreatedAt) {
+		t.Fatalf("CreatedAt order = %v, want strict batch order", []time.Time{got[0].CreatedAt, got[1].CreatedAt, got[2].CreatedAt})
+	}
+}
+
+func TestPostgres_EnqueueBatchEmpty(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	if err := s.EnqueueBatch(ctx, "q", nil); err != nil {
+		t.Fatalf("EnqueueBatch empty: %v", err)
+	}
+	if got, err := s.Dequeue(ctx, "q", 1); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("Dequeue after empty batch = %v, %v; want ErrEmpty", ids(got), err)
+	}
+}
+
+func TestPostgres_EnqueueBatchRollsBackOnDuplicateID(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	mustPgEnqueue(t, s, "q", Message{ID: "dupe"})
+
+	err := s.EnqueueBatch(ctx, "q", []Message{{ID: "a"}, {ID: "dupe"}, {ID: "c"}})
+	if err == nil {
+		t.Fatal("EnqueueBatch succeeded with duplicate ID")
+	}
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "dupe" {
+		t.Fatalf("after failed batch, got %v, want only [dupe]", ids(got))
+	}
+}
+
+func TestPostgres_EnqueueBatchPreservesDurableDedupe(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	mustPgEnqueue(t, s, "q", Message{ID: "first", DedupeKey: "same"})
+
+	if err := s.EnqueueBatch(ctx, "q", []Message{
+		{ID: "duplicate", DedupeKey: "same"},
+		{ID: "other"},
+	}); err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "first" || got[1].ID != "other" {
+		t.Fatalf("got %v, want [first other]", ids(got))
+	}
+}
+
+func TestPostgres_DequeueFIFOOrder(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	for i, p := range []string{"a", "b", "c", "d", "e"} {
+		mustPgEnqueue(t, s, "q", Message{ID: p, Payload: []byte{byte(i)}})
+	}
+
+	got, _ := s.Dequeue(ctx, "q", 3)
+	if len(got) != 3 {
+		t.Fatalf("first dequeue: got %d, want 3", len(got))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if got[i].ID != want {
+			t.Errorf("first[%d] = %q, want %q", i, got[i].ID, want)
+		}
+	}
+
+	got2, _ := s.Dequeue(ctx, "q", 10)
+	if len(got2) != 2 {
+		t.Fatalf("second dequeue: got %d, want 2", len(got2))
+	}
+	for i, want := range []string{"d", "e"} {
+		if got2[i].ID != want {
+			t.Errorf("second[%d] = %q, want %q", i, got2[i].ID, want)
+		}
+	}
+}
+
+func TestPostgres_DequeueVisibleAtFiltering(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+
+	mustPgEnqueue(t, s, "q", Message{ID: "due", ScheduledAt: time.Now().Add(-time.Second)})
+	mustPgEnqueue(t, s, "q", Message{ID: "due2", ScheduledAt: time.Now().Add(-time.Second)})
+	laterAt := time.Now().Add(500 * time.Millisecond)
+	mustPgEnqueue(t, s, "q", Message{ID: "later", ScheduledAt: laterAt})
+
+	got, err := s.Dequeue(ctx, "q", 5)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "due" || got[1].ID != "due2" {
+		t.Fatalf("got %v, want [due due2]", ids(got))
+	}
+
+	if _, err := s.Dequeue(ctx, "q", 5); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("before due: err = %v, want ErrEmpty", err)
+	}
+
+	time.Sleep(time.Until(laterAt) + 20*time.Millisecond)
+	got, err = s.Dequeue(ctx, "q", 5)
+	if err != nil {
+		t.Fatalf("Dequeue after delay: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "later" {
+		t.Fatalf("got %v, want [later]", ids(got))
+	}
+}
+
+func TestPostgres_EmptyQueueReturnsErrEmpty(t *testing.T) {
+	s := newTestPostgres(t)
+	if _, err := s.Dequeue(context.Background(), "q", 5); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("err = %v, want ErrEmpty", err)
+	}
+}
+
+func TestPostgres_AckRemovesMessage(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	mustPgEnqueue(t, s, "q", Message{ID: "x", Payload: []byte("x")})
+	mustPgEnqueue(t, s, "q", Message{ID: "y", Payload: []byte("y")})
+
+	if _, err := s.Dequeue(ctx, "q", 1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.Ack(ctx, "q", "x"); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+
+	got, _ := s.Dequeue(ctx, "q", 10)
+	if len(got) != 1 || got[0].ID != "y" {
+		t.Fatalf("after ack, got %v, want [y]", ids(got))
+	}
+}
+
+func TestPostgres_AckIgnoresPendingMessage(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	mustPgEnqueue(t, s, "q", Message{ID: "x", Payload: []byte("x")})
+
+	if err := s.Ack(ctx, "q", "x"); err != nil {
+		t.Fatalf("Ack pending: %v", err)
+	}
+	stats, err := s.Stats(ctx, "q")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Processed != 0 {
+		t.Fatalf("Processed = %d, want 0", stats.Processed)
+	}
+	got, err := s.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "x" {
+		t.Fatalf("after pending ack, got %v, want [x]", ids(got))
+	}
+}
+
+func TestPostgres_AckBatchCountsOnlyProcessing(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	for _, id := range []string{"a", "b", "c", "pending"} {
+		mustPgEnqueue(t, s, "q", Message{ID: id, Payload: []byte(id)})
+	}
+	if _, err := s.Dequeue(ctx, "q", 3); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.AckBatch(ctx, "q", []string{"a", "c", "pending", "missing"}); err != nil {
+		t.Fatalf("AckBatch: %v", err)
+	}
+	if err := s.AckBatch(ctx, "q", nil); err != nil {
+		t.Fatalf("AckBatch empty: %v", err)
+	}
+	stats, err := s.Stats(ctx, "q")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Processed != 2 {
+		t.Fatalf("Processed = %d, want 2", stats.Processed)
+	}
+	if err := s.Reclaim(ctx, "q"); err != nil {
+		t.Fatalf("Reclaim: %v", err)
+	}
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue remaining: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "b" || got[1].ID != "pending" {
+		t.Fatalf("remaining = %v, want [b pending]", ids(got))
+	}
+}
+
+func TestPostgres_Stats(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	mustPgEnqueue(t, s, "q", Message{ID: "ok", Payload: []byte("x")})
+	mustPgEnqueue(t, s, "q", Message{ID: "retry", Payload: []byte("y")})
+	mustPgEnqueue(t, s, "q", Message{ID: "dead", Payload: []byte("z")})
+
+	msgs, err := s.Dequeue(ctx, "q", 3)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.Ack(ctx, "q", "ok"); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if err := s.Retry(ctx, "q", msgs[1], errors.New("boom")); err != nil {
+		t.Fatalf("Retry: %v", err)
+	}
+	if err := s.DeadLetter(ctx, "q", msgs[2], errors.New("dead")); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+
+	stats, err := s.Stats(ctx, "q")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Processed != 1 {
+		t.Errorf("Processed = %d, want 1", stats.Processed)
+	}
+	if stats.Errors != 1 {
+		t.Errorf("Errors = %d, want 1", stats.Errors)
+	}
+	if stats.Retries != 1 {
+		t.Errorf("Retries = %d, want 1", stats.Retries)
+	}
+	if stats.Dead != 1 {
+		t.Errorf("Dead = %d, want 1", stats.Dead)
+	}
+}
+
+func TestPostgres_StatsDepthExcludesInFlight(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	for _, p := range []string{"a", "b", "c"} {
+		mustPgEnqueue(t, s, "q", Message{ID: p, Payload: []byte(p)})
+	}
+
+	if stats, _ := s.Stats(ctx, "q"); stats.Depth != 3 {
+		t.Fatalf("after enqueue, depth = %d, want 3", stats.Depth)
+	}
+	if _, err := s.Dequeue(ctx, "q", 2); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if stats, _ := s.Stats(ctx, "q"); stats.Depth != 1 {
+		t.Fatalf("after dequeue 2, depth = %d, want 1", stats.Depth)
+	}
+}
+
+func TestPostgres_CrashRecovery(t *testing.T) {
+	ctx := context.Background()
+	skipIfNoPostgres(t)
+
+	// Open, enqueue, dequeue (→ processing), close without acking.
+	s1, err := NewPostgres(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("NewPostgres s1: %v", err)
+	}
+	// Clean slate for this test.
+	_, _ = s1.pool.Exec(ctx, `DELETE FROM shoebox_messages`)
+	_, _ = s1.pool.Exec(ctx, `DELETE FROM shoebox_stats`)
+
+	mustPgEnqueue(t, s1, "q", Message{ID: "survivor", Payload: []byte("data")})
+
+	msgs, err := s1.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue s1: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].ID != "survivor" {
+		t.Fatalf("got %v, want [survivor]", ids(msgs))
+	}
+	_ = s1.Close()
+
+	// Reopen — Reclaim should transition 'processing' → 'pending'.
+	s2, err := NewPostgres(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("NewPostgres s2: %v", err)
+	}
+	defer func() {
+		_, _ = s2.pool.Exec(ctx, `DELETE FROM shoebox_messages`)
+		_, _ = s2.pool.Exec(ctx, `DELETE FROM shoebox_stats`)
+		_ = s2.Close()
+	}()
+
+	msgs2, err := s2.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue s2: %v", err)
+	}
+	if len(msgs2) != 1 || msgs2[0].ID != "survivor" {
+		t.Fatalf("after recovery, got %v, want [survivor]", ids(msgs2))
+	}
+	if string(msgs2[0].Payload) != "data" {
+		t.Errorf("payload = %q, want %q", string(msgs2[0].Payload), "data")
+	}
+}
+
+func TestPostgres_DeadLetterFlow(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	mustPgEnqueue(t, s, "orders", Message{ID: "poison", Payload: []byte("bad")})
+
+	msgs, err := s.Dequeue(ctx, "orders", 1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.DeadLetter(ctx, "orders", msgs[0], errors.New("handler failed")); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+
+	dead, err := s.List(ctx, "orders", 10)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(dead) != 1 {
+		t.Fatalf("got %d dead messages, want 1", len(dead))
+	}
+	if dead[0].ID != "poison" {
+		t.Errorf("dead[0].ID = %q, want %q", dead[0].ID, "poison")
+	}
+	if dead[0].Error != "handler failed" {
+		t.Errorf("dead[0].Error = %q, want %q", dead[0].Error, "handler failed")
+	}
+	dlq, err := s.List(ctx, "orders.dlq", 10)
+	if err != nil {
+		t.Fatalf("List DLQ: %v", err)
+	}
+	if len(dlq) != 1 || string(dlq[0].Payload) != "bad" {
+		t.Fatalf("DLQ = %+v, want one payload", dlq)
+	}
+}
+
+func TestPostgres_ListEmptyReturnsErrEmpty(t *testing.T) {
+	s := newTestPostgres(t)
+	if _, err := s.List(context.Background(), "q", 10); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("err = %v, want ErrEmpty", err)
+	}
+}
+
+func TestPostgres_MetadataRoundTrip(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	meta := map[string]string{"trace_id": "abc-123", "url": "https://example.com/hook"}
+	mustPgEnqueue(t, s, "q", Message{ID: "m", Metadata: meta, Payload: []byte("x")})
+
+	got, err := s.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d messages, want 1", len(got))
+	}
+	for k, want := range meta {
+		if got[0].Metadata[k] != want {
+			t.Errorf("metadata[%q] = %q, want %q", k, got[0].Metadata[k], want)
+		}
+	}
+}
+
+func TestPostgres_Reclaim(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	mustPgEnqueue(t, s, "q", Message{ID: "x", Payload: []byte("x")})
+
+	if _, err := s.Dequeue(ctx, "q", 1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := s.Reclaim(ctx, "q"); err != nil {
+		t.Fatalf("Reclaim: %v", err)
+	}
+
+	got, err := s.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue after reclaim: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "x" {
+		t.Fatalf("got %v, want [x]", ids(got))
+	}
+}
+
+// TestPostgres_ConcurrentDequeueNoDoubleDelivery is the E2-S4 regression
+// test. Two goroutines dequeue concurrently from the same queue using
+// separate connections. FOR UPDATE SKIP LOCKED guarantees no message is
+// delivered to both consumers.
+func TestPostgres_ConcurrentDequeueNoDoubleDelivery(t *testing.T) {
+	skipIfNoPostgres(t)
+
+	// Each consumer needs its own Postgres instance (own pool) so they
+	// don't share a transaction. But they share the same database table.
+	s1, err := NewPostgres(context.Background(), testDSN)
+	if err != nil {
+		t.Fatalf("NewPostgres s1: %v", err)
+	}
+	defer func() { _ = s1.Close() }()
+	ctx := context.Background()
+	_, _ = s1.pool.Exec(ctx, `DELETE FROM shoebox_messages`)
+	_, _ = s1.pool.Exec(ctx, `DELETE FROM shoebox_stats`)
+
+	s2, err := NewPostgres(context.Background(), testDSN)
+	if err != nil {
+		t.Fatalf("NewPostgres s2: %v", err)
+	}
+	defer func() {
+		_, _ = s2.pool.Exec(ctx, `DELETE FROM shoebox_messages`)
+		_, _ = s2.pool.Exec(ctx, `DELETE FROM shoebox_stats`)
+		_ = s2.Close()
+	}()
+
+	// Enqueue 50 messages.
+	const total = 50
+	for i := 0; i < total; i++ {
+		mustPgEnqueue(t, s1, "shared", Message{
+			ID:      fmt.Sprintf("msg-%d", i),
+			Payload: []byte("x"),
+		})
+	}
+
+	var got atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Consumer 1.
+	go func() {
+		defer wg.Done()
+		for {
+			msgs, err := s1.Dequeue(ctx, "shared", 5)
+			if errors.Is(err, ErrEmpty) {
+				return
+			}
+			if err != nil {
+				t.Errorf("consumer1 dequeue: %v", err)
+				return
+			}
+			got.Add(int64(len(msgs)))
+		}
+	}()
+
+	// Consumer 2.
+	go func() {
+		defer wg.Done()
+		for {
+			msgs, err := s2.Dequeue(ctx, "shared", 5)
+			if errors.Is(err, ErrEmpty) {
+				return
+			}
+			if err != nil {
+				t.Errorf("consumer2 dequeue: %v", err)
+				return
+			}
+			got.Add(int64(len(msgs)))
+		}
+	}()
+
+	wg.Wait()
+
+	if delivered := got.Load(); delivered != total {
+		t.Errorf("total delivered = %d, want %d (double-delivery detected)", delivered, total)
+	}
+}
+
+// upMigration returns the dialect's up migration with the given version.
+func upMigration(t *testing.T, dialect string, version int) migrations.Migration {
+	t.Helper()
+	ups, err := migrations.Up(dialect)
+	if err != nil {
+		t.Fatalf("migrations.Up(%s): %v", dialect, err)
+	}
+	for _, m := range ups {
+		if m.Version == version {
+			return m
+		}
+	}
+	t.Fatalf("no %s up migration with version %d", dialect, version)
+	return migrations.Migration{}
+}
+
+// dropPostgresTables removes every shoebox table, leaving an empty database.
+func dropPostgresTables(t *testing.T, s *Postgres) {
+	t.Helper()
+	for _, table := range []string{
+		"shoebox_messages", "shoebox_stats", "shoebox_schedules", "shoebox_schema_migrations",
+	} {
+		if _, err := s.pool.Exec(context.Background(), "DROP TABLE IF EXISTS "+table); err != nil {
+			t.Fatalf("drop %s: %v", table, err)
+		}
+	}
+}
+
+// assertPostgresMigrationVersions checks the exact version markers recorded
+// after a migration run.
+func assertPostgresMigrationVersions(t *testing.T, s *Postgres, want ...int) {
+	t.Helper()
+	rows, err := s.pool.Query(context.Background(),
+		`SELECT version FROM shoebox_schema_migrations ORDER BY version`)
+	if err != nil {
+		t.Fatalf("read migration versions: %v", err)
+	}
+	defer rows.Close()
+
+	var got []int
+	for rows.Next() {
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			t.Fatalf("scan migration version: %v", err)
+		}
+		got = append(got, version)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migration versions: %v", err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("migration versions = %v, want %v", got, want)
+	}
+}
+
+// TestPostgres_MigrationUpgradeFromV1 simulates a database created before
+// the migration runner existed, carrying only the 0001 schema (no priority
+// column, no version rows). Opening it with the current library must detect
+// the legacy baseline, apply 0002 through 0005, and end up fully functional.
+func TestPostgres_MigrationUpgradeFromV1(t *testing.T) {
+	skipIfNoPostgres(t)
+	ctx := context.Background()
+
+	// Empty the database, then apply only migration 0001 by hand.
+	s0 := newTestPostgres(t)
+	dropPostgresTables(t, s0)
+	if _, err := s0.pool.Exec(ctx, upMigration(t, "postgres", 1).SQL); err != nil {
+		t.Fatalf("apply 0001: %v", err)
+	}
+	_ = s0.Close()
+
+	// Open with the current library: baseline detection must record 1 and
+	// migrations 0002 through 0005 must be applied on open.
+	s, err := NewPostgres(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("NewPostgres on v1 database: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	// Priority ordering (0002's column) must work end to end.
+	mustPgEnqueue(t, s, "q", Message{ID: "low", Payload: []byte("low")})
+	mustPgEnqueue(t, s, "q", Message{ID: "high", Payload: []byte("high"), Priority: 2})
+	got, err := s.Dequeue(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "high" || got[1].ID != "low" {
+		t.Fatalf("dequeue after upgrade = [%s %s], want [high low]",
+			got[0].ID, got[1].ID)
+	}
+
+	var version int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT MAX(version) FROM shoebox_schema_migrations`).Scan(&version); err != nil {
+		t.Fatalf("read version: %v", err)
+	}
+	if version != 5 {
+		t.Fatalf("schema version after upgrade = %d, want 5", version)
+	}
+}
+
+// TestPostgres_MigrationFreshDatabase verifies a clean database receives all
+// schema migrations and exposes both queue and schedule storage.
+func TestPostgres_MigrationFreshDatabase(t *testing.T) {
+	s := newTestPostgres(t)
+	ctx := context.Background()
+	assertPostgresMigrationVersions(t, s, 1, 2, 3, 4, 5)
+
+	mustPgEnqueue(t, s, "q", Message{ID: "fresh", Payload: []byte("fresh")})
+	if got, err := s.Dequeue(ctx, "q", 1); err != nil {
+		t.Fatalf("Dequeue after fresh migration: %v", err)
+	} else if len(got) != 1 || got[0].ID != "fresh" {
+		t.Fatalf("dequeue after fresh migration = %v, want [fresh]", ids(got))
+	}
+
+	now := time.Now()
+	if err := s.CreateSchedule(ctx, Schedule{
+		ID: "fresh-schedule", Queue: "q", Payload: []byte("scheduled"),
+		EnqueueOptions: []byte("{}"), Interval: time.Minute,
+		NextRunAt: now.Add(-time.Second), Enabled: true,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateSchedule after fresh migration: %v", err)
+	}
+	due, err := s.DueSchedules(ctx, now, 1)
+	if err != nil {
+		t.Fatalf("DueSchedules after fresh migration: %v", err)
+	}
+	if len(due) != 1 || due[0].ID != "fresh-schedule" {
+		t.Fatalf("due schedules after fresh migration = %v, want [fresh-schedule]", due)
+	}
+}
+
+// TestPostgres_MigrationUpgradeFromV2 simulates the v0.1.6 schema: priority
+// exists, but the periodic-jobs and durable-dedupe artifacts do not.
+func TestPostgres_MigrationUpgradeFromV2(t *testing.T) {
+	skipIfNoPostgres(t)
+	ctx := context.Background()
+
+	s0 := newTestPostgres(t)
+	dropPostgresTables(t, s0)
+	for _, version := range []int{1, 2} {
+		if _, err := s0.pool.Exec(ctx, upMigration(t, "postgres", version).SQL); err != nil {
+			t.Fatalf("apply 000%d: %v", version, err)
+		}
+	}
+	_ = s0.Close()
+
+	s, err := NewPostgres(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("NewPostgres on v2 database: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	assertPostgresMigrationVersions(t, s, 2, 3, 4, 5)
+
+	mustPgEnqueue(t, s, "q", Message{ID: "v2", Payload: []byte("v2")})
+	got, err := s.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue after v2 upgrade: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "v2" {
+		t.Fatalf("dequeue after v2 upgrade = %v, want [v2]", ids(got))
+	}
+
+	now := time.Now()
+	if err := s.CreateSchedule(ctx, Schedule{
+		ID: "v2-schedule", Queue: "q", Payload: []byte("scheduled"),
+		EnqueueOptions: []byte("{}"), Interval: time.Minute,
+		NextRunAt: now.Add(-time.Second), Enabled: true,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateSchedule after v2 upgrade: %v", err)
+	}
+	due, err := s.DueSchedules(ctx, now, 1)
+	if err != nil {
+		t.Fatalf("DueSchedules after v2 upgrade: %v", err)
+	}
+	if len(due) != 1 || due[0].ID != "v2-schedule" {
+		t.Fatalf("due schedules after v2 upgrade = %v, want [v2-schedule]", due)
+	}
+}
+
+// TestPostgres_MigrationRepairFromPoisonedVersion simulates the v0.1.7 bug:
+// the database claims version 4 while the 0003/0004 objects are absent.
+func TestPostgres_MigrationRepairFromPoisonedVersion(t *testing.T) {
+	skipIfNoPostgres(t)
+	ctx := context.Background()
+
+	s0 := newTestPostgres(t)
+	dropPostgresTables(t, s0)
+	for _, version := range []int{1, 2} {
+		if _, err := s0.pool.Exec(ctx, upMigration(t, "postgres", version).SQL); err != nil {
+			t.Fatalf("apply 000%d: %v", version, err)
+		}
+	}
+	if _, err := s0.pool.Exec(ctx, `CREATE TABLE shoebox_schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`); err != nil {
+		t.Fatalf("create migration marker: %v", err)
+	}
+	if _, err := s0.pool.Exec(ctx, `INSERT INTO shoebox_schema_migrations (version) VALUES (4)`); err != nil {
+		t.Fatalf("insert poisoned migration marker: %v", err)
+	}
+	_ = s0.Close()
+
+	s, err := NewPostgres(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("NewPostgres on poisoned database: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	assertPostgresMigrationVersions(t, s, 4, 5)
+
+	mustPgEnqueue(t, s, "q", Message{ID: "repaired", Payload: []byte("repaired")})
+	got, err := s.Dequeue(ctx, "q", 1)
+	if err != nil {
+		t.Fatalf("Dequeue after poisoned-version repair: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "repaired" {
+		t.Fatalf("dequeue after poisoned-version repair = %v, want [repaired]", ids(got))
+	}
+
+	now := time.Now()
+	if err := s.CreateSchedule(ctx, Schedule{
+		ID: "repaired-schedule", Queue: "q", Payload: []byte("scheduled"),
+		EnqueueOptions: []byte("{}"), Interval: time.Minute,
+		NextRunAt: now.Add(-time.Second), Enabled: true,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateSchedule after poisoned-version repair: %v", err)
+	}
+	due, err := s.DueSchedules(ctx, now, 1)
+	if err != nil {
+		t.Fatalf("DueSchedules after poisoned-version repair: %v", err)
+	}
+	if len(due) != 1 || due[0].ID != "repaired-schedule" {
+		t.Fatalf("due schedules after poisoned-version repair = %v, want [repaired-schedule]", due)
+	}
+}
+
+// TestPostgres_ConcurrentOpenMigratesOnce verifies the advisory lock
+// serialises concurrent opens: several processes opening the same fresh
+// database all succeed, and each migration is recorded exactly once.
+func TestPostgres_ConcurrentOpenMigratesOnce(t *testing.T) {
+	skipIfNoPostgres(t)
+	ctx := context.Background()
+
+	// Empty database.
+	s0 := newTestPostgres(t)
+	dropPostgresTables(t, s0)
+	_ = s0.Close()
+
+	const openers = 4
+	var wg sync.WaitGroup
+	errCh := make(chan error, openers)
+	for range openers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := NewPostgres(ctx, testDSN)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer func() { _ = s.Close() }()
+			if err := s.Enqueue(ctx, "q", Message{
+				ID: NewMessageID(), Payload: []byte("m"),
+			}); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent open: %v", err)
+	}
+
+	s, err := NewPostgres(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("verify open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	// One row per applied migration. The version primary key plus the
+	// advisory lock make duplicates impossible.
+	var rows int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM shoebox_schema_migrations`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 5 {
+		t.Fatalf("migration rows after %d concurrent opens = %d, want 5", openers, rows)
+	}
+
+	// Every opener's enqueue survived: migration and message traffic did
+	// not interfere.
+	var depth int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM shoebox_messages`).Scan(&depth); err != nil {
+		t.Fatal(err)
+	}
+	if depth != openers {
+		t.Fatalf("messages enqueued during concurrent open = %d, want %d", depth, openers)
+	}
+}
